@@ -1,0 +1,338 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Generate project files
+        run: |
+          cat > settings.gradle.kts <<'KT_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MT5Tracker"
+          include(":app")
+          KT_EOF
+          cat > build.gradle.kts <<'KT_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          KT_EOF
+          cat > gradle.properties <<'KT_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          KT_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'KT_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.mt5tracker"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.mt5tracker"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+          }
+
+          dependencies {
+              val bom = platform("androidx.compose:compose-bom:2024.06.00")
+              implementation(bom)
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.activity:activity-compose:1.9.0")
+          }
+          KT_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'KT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="true"
+                  android:label="MT5 Tracker"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          KT_EOF
+          mkdir -p app/src/main/java/com/example/mt5tracker
+          cat > app/src/main/java/com/example/mt5tracker/Parser.kt <<'KT_EOF'
+          package com.example.mt5tracker
+
+          import java.nio.charset.Charset
+
+          data class Trade(
+              val id: String,
+              val symbol: String,
+              val type: String,
+              val volume: Double,
+              val closeTime: String,
+              val net: Double // profit + commission + swap
+          ) {
+              fun toLine() = listOf(id, symbol, type, volume, closeTime, net).joinToString("|")
+
+              companion object {
+                  fun fromLine(s: String): Trade? {
+                      val p = s.split("|")
+                      if (p.size != 6) return null
+                      return Trade(p[0], p[1], p[2], p[3].toDoubleOrNull() ?: 0.0, p[4], p[5].toDoubleOrNull() ?: return null)
+                  }
+              }
+          }
+
+          // File laporan MT5 sering berformat UTF-16 (HTML), jadi cek BOM dulu.
+          fun decode(bytes: ByteArray): String {
+              if (bytes.size >= 2) {
+                  val b0 = bytes[0].toInt() and 0xFF
+                  val b1 = bytes[1].toInt() and 0xFF
+                  if ((b0 == 0xFF && b1 == 0xFE) || (b0 == 0xFE && b1 == 0xFF)) {
+                      return String(bytes, Charset.forName("UTF-16"))
+                  }
+              }
+              return String(bytes, Charsets.UTF_8)
+          }
+
+          private fun htmlRows(text: String): List<List<String>> {
+              val rowRe = Regex("<tr[^>]*>(.*?)</tr>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+              val cellRe = Regex("<t[dh][^>]*>(.*?)</t[dh]>", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+              val tagRe = Regex("<[^>]+>")
+              return rowRe.findAll(text).map { row ->
+                  cellRe.findAll(row.groupValues[1]).map {
+                      tagRe.replace(it.groupValues[1], "")
+                          .replace("&nbsp;", " ").replace("&amp;", "&").trim()
+                  }.toList()
+              }.toList()
+          }
+
+          private fun csvRows(text: String): List<List<String>> =
+              text.lines().filter { it.isNotBlank() }.map { line ->
+                  val d = listOf('\t', ';', ',').maxByOrNull { c -> line.count { it == c } } ?: ','
+                  line.split(d).map { it.trim().trim('"') }
+              }
+
+          private fun num(s: String): Double? {
+              var t = s.replace("\u00A0", "").replace(" ", "")
+              if (t.isEmpty()) return null
+              t = if (t.contains(',') && !t.contains('.')) t.replace(',', '.') else t.replace(",", "")
+              return t.toDoubleOrNull()
+          }
+
+          fun parseReport(text: String): List<Trade> {
+              val rows = if (text.contains("<tr", ignoreCase = true)) htmlRows(text) else csvRows(text)
+              var header: List<String>? = null
+              val out = mutableListOf<Trade>()
+              for (r in rows) {
+                  val low = r.map { it.lowercase() }
+                  if (header == null) {
+                      if ("profit" in low && "symbol" in low) header = low
+                      continue
+                  }
+                  val h = header
+                  val iSym = h.indexOf("symbol")
+                  val iType = h.indexOf("type")
+                  val iVol = h.indexOf("volume")
+                  val iId = listOf("position", "ticket", "order", "deal").map { h.indexOf(it) }.firstOrNull { it >= 0 } ?: -1
+                  val iTime = h.indices.filter { h[it] == "time" }.lastOrNull() ?: -1
+                  val iProfit = h.lastIndexOf("profit")
+                  val iComm = h.lastIndexOf("commission")
+                  val iSwap = h.lastIndexOf("swap")
+                  if (iSym < 0 || iType < 0 || iProfit < 0 || r.size <= iProfit) continue
+
+                  val type = r.getOrElse(iType) { "" }.lowercase()
+                  if (type != "buy" && type != "sell") continue
+                  val profit = num(r[iProfit]) ?: continue
+                  val comm = if (iComm >= 0) num(r.getOrElse(iComm) { "" }) ?: 0.0 else 0.0
+                  val swap = if (iSwap >= 0) num(r.getOrElse(iSwap) { "" }) ?: 0.0 else 0.0
+                  out += Trade(
+                      id = if (iId >= 0) r.getOrElse(iId) { "" } else "",
+                      symbol = r[iSym],
+                      type = type,
+                      volume = if (iVol >= 0) num(r.getOrElse(iVol) { "" }) ?: 0.0 else 0.0,
+                      closeTime = if (iTime >= 0) r.getOrElse(iTime) { "" } else "",
+                      net = profit + comm + swap
+                  )
+              }
+              return out
+          }
+          KT_EOF
+          mkdir -p app/src/main/java/com/example/mt5tracker
+          cat > app/src/main/java/com/example/mt5tracker/Stats.kt <<'KT_EOF'
+          package com.example.mt5tracker
+
+          import android.content.Context
+
+          data class Stats(
+              val count: Int, val wins: Int, val winRate: Double, val net: Double,
+              val avgWin: Double, val avgLoss: Double, val profitFactor: Double,
+              val best: Double, val worst: Double, val bySymbol: List<Pair<String, Double>>
+          )
+
+          fun computeStats(t: List<Trade>): Stats {
+              val w = t.filter { it.net > 0 }
+              val l = t.filter { it.net < 0 }
+              val gp = w.sumOf { it.net }
+              val gl = -l.sumOf { it.net }
+              return Stats(
+                  count = t.size,
+                  wins = w.size,
+                  winRate = if (t.isEmpty()) 0.0 else w.size * 100.0 / t.size,
+                  net = t.sumOf { it.net },
+                  avgWin = if (w.isEmpty()) 0.0 else gp / w.size,
+                  avgLoss = if (l.isEmpty()) 0.0 else -gl / l.size,
+                  profitFactor = if (gl == 0.0) 0.0 else gp / gl,
+                  best = t.maxOfOrNull { it.net } ?: 0.0,
+                  worst = t.minOfOrNull { it.net } ?: 0.0,
+                  bySymbol = t.groupBy { it.symbol }.map { it.key to it.value.sumOf { x -> x.net } }
+                      .sortedByDescending { it.second }
+              )
+          }
+
+          object Store {
+              private const val KEY = "trades"
+              private fun prefs(c: Context) = c.getSharedPreferences("mt5tracker", Context.MODE_PRIVATE)
+
+              fun load(c: Context): List<Trade> =
+                  (prefs(c).getStringSet(KEY, emptySet()) ?: emptySet()).mapNotNull { Trade.fromLine(it) }
+                      .sortedBy { it.closeTime }
+
+              // Trade yang sama (baris identik) tidak akan tersimpan dua kali.
+              fun add(c: Context, new: List<Trade>): List<Trade> {
+                  val set = HashSet(prefs(c).getStringSet(KEY, emptySet()) ?: emptySet())
+                  set.addAll(new.map { it.toLine() })
+                  prefs(c).edit().putStringSet(KEY, set).apply()
+                  return load(c)
+              }
+
+              fun clear(c: Context) = prefs(c).edit().remove(KEY).apply()
+          }
+          KT_EOF
+          mkdir -p app/src/main/java/com/example/mt5tracker
+          cat > app/src/main/java/com/example/mt5tracker/MainActivity.kt <<'KT_EOF'
+          package com.example.mt5tracker
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { MaterialTheme { App() } }
+              }
+          }
+
+          private fun fmt(v: Double) = String.format("%,.2f", v)
+
+          @Composable
+          fun App() {
+              val ctx = LocalContext.current
+              var trades by remember { mutableStateOf(Store.load(ctx)) }
+              var msg by remember { mutableStateOf("") }
+
+              val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                  if (uri == null) return@rememberLauncherForActivityResult
+                  val bytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                  if (bytes == null) {
+                      msg = "Gagal membaca file."
+                      return@rememberLauncherForActivityResult
+                  }
+                  val parsed = parseReport(decode(bytes))
+                  if (parsed.isEmpty()) {
+                      msg = "Tidak ada trade yang terbaca. Pastikan file berisi tabel dengan kolom Symbol, Type, dan Profit."
+                  } else {
+                      val before = trades.size
+                      trades = Store.add(ctx, parsed)
+                      msg = "${parsed.size} trade terbaca, ${trades.size - before} baru ditambahkan."
+                  }
+              }
+
+              val s = remember(trades) { computeStats(trades) }
+
+              LazyColumn(
+                  modifier = Modifier.fillMaxSize().statusBarsPadding().padding(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(8.dp)
+              ) {
+                  item { Text("MT5 Tracker", style = MaterialTheme.typography.headlineSmall) }
+                  item {
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          Button(onClick = { picker.launch(arrayOf("*/*")) }) { Text("Import laporan") }
+                          OutlinedButton(onClick = { Store.clear(ctx); trades = emptyList(); msg = "Data dihapus." }) {
+                              Text("Hapus data")
+                          }
+                      }
+                  }
+                  if (msg.isNotEmpty()) item { Text(msg, style = MaterialTheme.typography.bodySmall) }
+                  item { Divider() }
+                  item { Row2("Total trade", s.count.toString()) }
+                  item { Row2("Win rate", "${fmt(s.winRate)}% (${s.wins} menang)") }
+                  item { Row2("Net profit", fmt(s.net)) }
+                  item { Row2("Rata-rata menang", fmt(s.avgWin)) }
+                  item { Row2("Rata-rata kalah", fmt(s.avgLoss)) }
+                  item { Row2("Profit factor", fmt(s.profitFactor)) }
+                  item { Row2("Trade terbaik", fmt(s.best)) }
+                  item { Row2("Trade terburuk", fmt(s.worst)) }
+                  item { Divider() }
+                  item { Text("Profit per pair", style = MaterialTheme.typography.titleMedium) }
+                  items(s.bySymbol) { (sym, p) -> Row2(sym, fmt(p)) }
+              }
+          }
+
+          @Composable
+          fun Row2(label: String, value: String) {
+              Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                  Text(label)
+                  Text(value, style = MaterialTheme.typography.titleSmall)
+              }
+          }
+          KT_EOF
+
+      - name: Build APK
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MT5Tracker-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
